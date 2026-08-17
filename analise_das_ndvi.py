@@ -19,6 +19,7 @@ OUTPUT_DIR = "outputs"
 GEE_PROJECT_ID = os.getenv("EE_PROJECT_ID", "ndvi-estudos")
 
 DAS_STEP_DAYS = 15
+FALLBACK_WINDOW_DAYS = [21, 30]
 MAX_CLOUD_PERCENTAGE = 95
 REDUCTION_SCALE = 10
 MAP_DIMENSIONS = 900
@@ -34,9 +35,9 @@ NDVI_PALETTE = [
 
 SAFRAS_PADRONIZADAS = [
     {"safra": "2018-2019", "inicio": "2018-11-15", "fim": "2019-04-01"},
-    {"safra": "2019-2020", "inicio": "2019-11-12", "fim": "2020-03-31"},
+    {"safra": "2019-2020", "inicio": "2019-11-12", "fim": "2020-04-05"},
     {"safra": "2021-2022", "inicio": "2021-11-10", "fim": "2022-04-06"},
-    {"safra": "2022-2023", "inicio": "2022-11-01", "fim": "2023-04-22"},
+    {"safra": "2022-2023", "inicio": "2022-11-01", "fim": "2023-04-05"},
     {"safra": "2023-2024", "inicio": "2023-11-14", "fim": "2024-04-02"},
     {"safra": "2025-2026", "inicio": "2025-11-11", "fim": "2026-03-31"},
 ]
@@ -212,10 +213,91 @@ def build_das_periods(inicio: date, fim: date):
     return periods
 
 
+def centered_window(base_start: date, base_end: date, desired_days: int, cycle_start: date, cycle_end: date):
+    base_days = (base_end - base_start).days + 1
+    if desired_days <= base_days:
+        return base_start, base_end
+
+    extra_days = desired_days - base_days
+    extend_left = extra_days // 2
+    extend_right = extra_days - extend_left
+
+    window_start = base_start - timedelta(days=extend_left)
+    window_end = base_end + timedelta(days=extend_right)
+
+    if window_start < cycle_start:
+        shift = cycle_start - window_start
+        window_start = cycle_start
+        window_end = min(cycle_end, window_end + shift)
+
+    if window_end > cycle_end:
+        shift = window_end - cycle_end
+        window_end = cycle_end
+        window_start = max(cycle_start, window_start - shift)
+
+    return window_start, window_end
+
+
+def resolve_period_stats(ee_geometry, period_start: date, period_end: date, cycle_start: date, cycle_end: date):
+    window_attempts = [DAS_STEP_DAYS, *FALLBACK_WINDOW_DAYS]
+    last_stats = None
+
+    for window_days in window_attempts:
+        query_start, query_end = centered_window(
+            period_start,
+            period_end,
+            window_days,
+            cycle_start,
+            cycle_end,
+        )
+        collection = build_sentinel_collection(ee_geometry, query_start, query_end)
+        stats = compute_collection_stats(collection, ee_geometry)
+        stats["janela_dias"] = (query_end - query_start).days + 1
+        stats["janela_inicio"] = query_start
+        stats["janela_fim"] = query_end
+        last_stats = stats
+
+        if stats["status"] == "ok":
+            stats["fallback_utilizado"] = stats["janela_dias"] != DAS_STEP_DAYS
+            return stats
+
+    last_stats["fallback_utilizado"] = last_stats["janela_dias"] != DAS_STEP_DAYS
+    return last_stats
+
+
 def percent(value: int, total: int):
     if total == 0:
         return 100.0
     return (value / total) * 100
+
+
+def build_plot_series(df: pd.DataFrame):
+    df = df.copy()
+    df["NDVI_Plot"] = df["NDVI_Observado"]
+    df["Fonte_Plot"] = "observado"
+    df.loc[df["NDVI_Observado"].isna(), "Fonte_Plot"] = "sem_dado"
+
+    values = df["NDVI_Observado"].tolist()
+    filled_values = df["NDVI_Plot"].tolist()
+    sources = df["Fonte_Plot"].tolist()
+
+    for index, value in enumerate(values):
+        if value is not None and not pd.isna(value):
+            continue
+        if index == 0 or index == len(values) - 1:
+            continue
+
+        prev_value = values[index - 1]
+        next_value = values[index + 1]
+        if pd.isna(prev_value) or pd.isna(next_value):
+            continue
+
+        filled_values[index] = float(prev_value + (next_value - prev_value) / 2)
+        sources[index] = "interpolado_curto"
+
+    df["NDVI_Plot"] = filled_values
+    df["Fonte_Plot"] = sources
+    return df
 
 
 def make_placeholder_image(label: str, output_path: str):
@@ -261,13 +343,39 @@ def download_ndvi_image(ndvi_image, ee_geometry, geometry_bounds, label: str, ou
 
 def plot_single_harvest(df: pd.DataFrame, safra: str, output_path: str):
     plt.figure(figsize=(12, 5))
-    plt.plot(df["DAS"], df["NDVI"], color="forestgreen", linewidth=2, marker="o", markersize=5)
+    plt.plot(df["DAS"], df["NDVI_Plot"], color="forestgreen", linewidth=2)
+
+    observed = df[df["Fonte_Plot"] == "observado"]
+    if not observed.empty:
+        plt.scatter(
+            observed["DAS"],
+            observed["NDVI_Observado"],
+            color="forestgreen",
+            s=36,
+            zorder=3,
+            label="Observado",
+        )
+
+    interpolated = df[df["Fonte_Plot"] == "interpolado_curto"]
+    if not interpolated.empty:
+        plt.scatter(
+            interpolated["DAS"],
+            interpolated["NDVI_Plot"],
+            color="#f39c12",
+            marker="X",
+            s=56,
+            zorder=4,
+            label="Interpolado para plot",
+        )
+
     plt.title(f"Curva de NDVI por DAS - Safra {safra}")
     plt.xlabel("DAS")
     plt.ylabel("NDVI mediano do talhao")
     plt.ylim(0, 1)
     plt.xticks(df["DAS"])
     plt.grid(True, linestyle=":", alpha=0.6)
+    if not interpolated.empty:
+        plt.legend()
     plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close()
@@ -278,7 +386,7 @@ def plot_overlay(all_data: pd.DataFrame, output_path: str):
     for safra, df_safra in all_data.groupby("Safra"):
         plt.plot(
             df_safra["DAS"],
-            df_safra["NDVI"],
+            df_safra["NDVI_Plot"],
             linewidth=2,
             marker="o",
             markersize=4,
@@ -309,21 +417,26 @@ def run_single_harvest(safra_config, ee_geometry, geometry_bounds, global_index_
     rows = []
     for local_index, period in enumerate(periods, start=1):
         das_label = f"DAS_{period['das']:03d}"
-        collection = build_sentinel_collection(ee_geometry, period["inicio"], period["fim"])
-        stats = compute_collection_stats(collection, ee_geometry)
+        stats = resolve_period_stats(
+            ee_geometry,
+            period["inicio"],
+            period["fim"],
+            inicio,
+            fim,
+        )
 
         global_done = global_index_start + local_index
         progress_text = f"{percent(global_done, total_periods):.1f}%"
 
         if stats["status"] == "ok":
             ndvi_value = stats["ndvi_median"]
-            status_text = f"NDVI={ndvi_value:.4f}"
+            status_text = f"NDVI={ndvi_value:.4f} | janela={stats['janela_dias']}d"
         elif stats["status"] == "no_scenes":
             ndvi_value = None
-            status_text = "sem cenas"
+            status_text = f"sem cenas ate {stats['janela_dias']}d"
         else:
             ndvi_value = None
-            status_text = "sem pixel valido"
+            status_text = f"sem pixel valido ate {stats['janela_dias']}d"
 
         log(f"{safra} | {das_label} | progresso {progress_text} | {status_text}")
 
@@ -332,9 +445,14 @@ def run_single_harvest(safra_config, ee_geometry, geometry_bounds, global_index_
                 "Safra": safra,
                 "DAS": period["das"],
                 "Rotulo_DAS": das_label,
-                "Data_Inicial": period["inicio"].isoformat(),
-                "Data_Final": period["fim"].isoformat(),
-                "NDVI": ndvi_value,
+                "Data_Inicial_Base": period["inicio"].isoformat(),
+                "Data_Final_Base": period["fim"].isoformat(),
+                "Data_Inicial_Consulta": stats["janela_inicio"].isoformat(),
+                "Data_Final_Consulta": stats["janela_fim"].isoformat(),
+                "Janela_Dias_Usada": stats["janela_dias"],
+                "Fallback_Utilizado": stats["fallback_utilizado"],
+                "Status_Coleta": stats["status"],
+                "NDVI_Observado": ndvi_value,
                 "Numero_Imagens": stats["image_count"],
                 "Pixels_Validos": stats["pixel_count"],
             }
@@ -351,8 +469,11 @@ def run_single_harvest(safra_config, ee_geometry, geometry_bounds, global_index_
         )
 
     df = pd.DataFrame(rows)
-    df["Data_Inicial"] = pd.to_datetime(df["Data_Inicial"])
-    df["Data_Final"] = pd.to_datetime(df["Data_Final"])
+    df["Data_Inicial_Base"] = pd.to_datetime(df["Data_Inicial_Base"])
+    df["Data_Final_Base"] = pd.to_datetime(df["Data_Final_Base"])
+    df["Data_Inicial_Consulta"] = pd.to_datetime(df["Data_Inicial_Consulta"])
+    df["Data_Final_Consulta"] = pd.to_datetime(df["Data_Final_Consulta"])
+    df = build_plot_series(df)
 
     csv_path = os.path.join(harvest_dir, f"ndvi_das_{safra.replace('-', '_')}.csv")
     graph_path = os.path.join(harvest_dir, f"curva_ndvi_das_{safra.replace('-', '_')}.png")
