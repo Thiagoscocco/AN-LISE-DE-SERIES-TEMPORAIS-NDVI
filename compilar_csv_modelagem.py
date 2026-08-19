@@ -53,6 +53,66 @@ def percent(value: int, total: int):
     return (value / total) * 100
 
 
+def overlap_days(start_a, end_a, start_b, end_b):
+    overlap_start = max(start_a, start_b)
+    overlap_end = min(end_a, end_b)
+    if overlap_end < overlap_start:
+        return 0
+    return (overlap_end - overlap_start).days + 1
+
+
+def is_non_independent_point(current_row, previous_row):
+    if pd.isna(current_row["NDVI t_bruto"]) or pd.isna(previous_row["NDVI t_bruto"]):
+        return False
+
+    overlap = overlap_days(
+        current_row["Data_Inicial_Consulta"],
+        current_row["Data_Final_Consulta"],
+        previous_row["Data_Inicial_Consulta"],
+        previous_row["Data_Final_Consulta"],
+    )
+    if overlap <= 0:
+        return False
+
+    current_window_days = int(current_row["Janela_Dias_Usada"])
+    previous_window_days = int(previous_row["Janela_Dias_Usada"])
+    overlap_ratio = overlap / min(current_window_days, previous_window_days)
+
+    same_ndvi_value = abs(float(current_row["NDVI t_bruto"]) - float(previous_row["NDVI t_bruto"])) < 1e-9
+    current_is_partial = int(current_row["Dias_No_Periodo_Base"]) < int(ndvi_module.DAS_STEP_DAYS)
+    current_has_fallback = bool(current_row["Fallback_Utilizado"])
+
+    return same_ndvi_value and overlap_ratio >= 0.5 and (current_is_partial or current_has_fallback)
+
+
+def apply_independence_filter(ndvi_df: pd.DataFrame):
+    filtered_frames = []
+
+    for safra, safra_df in ndvi_df.groupby("safra", sort=False):
+        safra_df = safra_df.sort_values("DAS_atual").reset_index(drop=True).copy()
+        safra_df["NDVI t"] = safra_df["NDVI t_bruto"]
+        safra_df["Motivo_Filtro"] = pd.NA
+
+        for index in range(1, len(safra_df)):
+            current_row = safra_df.loc[index]
+            previous_row = safra_df.loc[index - 1]
+
+            if not is_non_independent_point(current_row, previous_row):
+                continue
+
+            safra_df.at[index, "NDVI t"] = pd.NA
+            safra_df.at[index, "Motivo_Filtro"] = "nao_independente_do_das_anterior"
+            log(
+                f"Filtro RF {safra} | DAS_{int(current_row['DAS_atual']):03d} | "
+                "NDVI convertido para NaN por reutilizar observacao do DAS anterior."
+            )
+
+        safra_df["NDVI t-1"] = safra_df["NDVI t"].shift(1)
+        filtered_frames.append(safra_df)
+
+    return pd.concat(filtered_frames, ignore_index=True)
+
+
 def build_ndvi_frame(ee_geometry):
     all_rows = []
     total_periods = sum(
@@ -90,12 +150,17 @@ def build_ndvi_frame(ee_geometry):
                 {
                     "safra": safra,
                     "DAS_atual": period["das"],
-                    "NDVI t": stats["ndvi_median"] if stats["status"] == "ok" else pd.NA,
+                    "Data_Inicial_Consulta": pd.Timestamp(stats["janela_inicio"]),
+                    "Data_Final_Consulta": pd.Timestamp(stats["janela_fim"]),
+                    "Janela_Dias_Usada": int(stats["janela_dias"]),
+                    "Fallback_Utilizado": bool(stats["fallback_utilizado"]),
+                    "Dias_No_Periodo_Base": int((period["fim"] - period["inicio"]).days + 1),
+                    "NDVI t_bruto": stats["ndvi_median"] if stats["status"] == "ok" else pd.NA,
                 }
             )
 
     ndvi_df = pd.DataFrame(all_rows).sort_values(["safra", "DAS_atual"]).reset_index(drop=True)
-    ndvi_df["NDVI t-1"] = ndvi_df.groupby("safra")["NDVI t"].shift(1)
+    ndvi_df = apply_independence_filter(ndvi_df)
     return ndvi_df
 
 
